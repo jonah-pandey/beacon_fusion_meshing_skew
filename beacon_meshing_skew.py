@@ -1,109 +1,44 @@
 import numpy as np
-from scipy.interpolate import PchipInterpolator
+from scipy.interpolate import griddata
 from typing import List, Tuple, Optional, Any
 
 class FusedMeshSkewTransform:
     def __init__(self, config: Any) -> None:
-        """
-        Initializes the analytical tracking extension and sets up configuration keys.
-
-        Args:
-            config (Any): Klipper configuration wrapper object used to parse parameters
-                from the printer configuration file.
-
-        Raises:
-            config.error: If 'solving_method' is not 'tps' or 'co_kriging'.
-            config.error: If 'skew_method' is not 'none', 'traditional', or 'non_linear_field'.
-            config.error: If 'skew_method' is 'traditional' and 'traditional_skew_mode'
-                is not 'x', 'y', or 'xy'.
-        """
+        """Initializes the analytical tracking extension."""
         self.printer: Any = config.get_printer()
         self.gcode: Any = self.printer.lookup_object('gcode')
         self.base_config: Any = config
         
-        self.solving_method: str = config.get('solving_method').lower()
-        if self.solving_method not in ['tps', 'co_kriging']:
-            raise config.error("Explicit 'solving_method' ('tps' or 'co_kriging') must be specified.")
-            
-        self.skew_method: str = config.get('skew_method').lower()
-        if self.skew_method not in ['none', 'traditional', 'non_linear_field']:
-            raise config.error("Explicit 'skew_method' ('none', 'traditional', or 'non_linear_field') must be specified.")
-
-        self.contact_probe_count: List[int] = config.getintlist('contact_probe_count', default=[7, 7], count=2)
+        self.solving_method: str = config.get('solving_method', 'co_kriging').lower()
+        self.skew_method: str = config.get('skew_method', 'non_linear_field').lower()
 
         self.is_mesh_calibrated: bool = False
-        self.scaling_coefficient_rho: Optional[float] = None
-        self.spatial_lengthscale_low_fidelity: Optional[float] = None
-        self.spatial_lengthscale_discrepancy: Optional[float] = None
-        self.process_variance_low_fidelity: Optional[float] = None
-        self.process_variance_discrepancy: Optional[float] = None
         
-        self.low_fidelity_sensor_noise_standard_deviation: Optional[float] = None
-        self.high_fidelity_sensor_noise_standard_deviation: Optional[float] = None
+        # Buffer for the Contact Anchor Data
+        self.contact_coordinates: Optional[np.ndarray] = None
+        self.contact_heights: Optional[np.ndarray] = None
 
+        # Transformation Data
         self.traditional_alignment_matrix: np.ndarray = np.eye(2)
         self.thin_plate_spline_coefficients_x: Optional[np.ndarray] = None
         self.thin_plate_spline_coefficients_y: Optional[np.ndarray] = None
         self.skew_control_nodes: Optional[np.ndarray] = None  
-
-        if self.skew_method == 'traditional':
-            self.traditional_skew_mode: str = config.get('traditional_skew_mode').lower()
-            if self.traditional_skew_mode not in ['x', 'y', 'xy']:
-                raise config.error("traditional_mode must be explicitly set to 'x', 'y', or 'xy'.")
         
-        self.gcode.register_command('FUSED_BED_MESH_CALIBRATE', self.cmd_FUSED_BED_MESH_CALIBRATE,
-                                    desc="Isolated Dual-Fidelity Surface Fusion Calibration Sequence")
+        # Register the two synchronous math execution endpoints
+        self.gcode.register_command('_SAVE_HIGH_FIDELITY_MESH', self.cmd_SAVE_HIGH_FIDELITY_MESH,
+                                    desc="Buffers contact anchors before inductive pass")
+        self.gcode.register_command('_COMPUTE_KINEMATIC_MANIFOLD', self.cmd_COMPUTE_KINEMATIC_MANIFOLD,
+                                    desc="Executes Co-Kriging Fusion and TPS Space Warping")
 
     def _thin_plate_spline_kernel(self, radius: np.ndarray) -> np.ndarray:
-        """
-        Computes the 2D biharmonic radial basis function kernel.
-
-        Mathematical Formulation:
-            U(r) = r^2 * ln(r) if r > 0 else 0.0
-
-        Args:
-            radius (np.ndarray): Euclidean radial distance metrics (r).
-
-        Returns:
-            np.ndarray: Evaluated kernel basis space outputs.
-        """
         return np.where(radius > 0, (radius**2) * np.log(radius), 0.0)
 
     def _squared_exponential_kernel(self, coordinates_set_1: np.ndarray, coordinates_set_2: np.ndarray, 
                                     process_variance: float, spatial_lengthscale: float) -> np.ndarray:
-        """
-        Evaluates the anisotropic squared-exponential covariance kernel matrix.
-
-        Mathematical Formulation:
-            K(x, x') = sigma^2 * exp(-||x - x'||^2 / (2 * ell^2))
-
-        Args:
-            coordinates_set_1 (np.ndarray): Primary matrix of position vectors shape (M, 2).
-            coordinates_set_2 (np.ndarray): Secondary matrix of position vectors shape (N, 2).
-            process_variance (float): Signal amplitude scaling coefficient (sigma).
-            spatial_lengthscale (float): Spatial correlation decay metric (ell).
-
-        Returns:
-            np.ndarray: Computed covariance evaluation matrix of shape (M, N).
-        """
         squared_distances = np.sum((coordinates_set_1[:, None, :] - coordinates_set_2[None, :, :])**2, axis=-1)
         return (process_variance**2) * np.exp(-squared_distances / (2.0 * (spatial_lengthscale**2)))
 
     def _solve_thin_plate_spline_system(self, control_nodes: np.ndarray, target_displacements: np.ndarray) -> np.ndarray:
-        """
-        Solves the linear system equations to extract non-homogeneous warping weights.
-
-        System Block Layout:
-            [ K   P ] [ w ]   [ v ]
-            [ P^T 0 ] [ a ] = [ 0 ]
-
-        Args:
-            control_nodes (np.ndarray): Matrix of anchor node positions of shape (N, 2).
-            target_displacements (np.ndarray): Target directional distortion scalars of shape (N,).
-
-        Returns:
-            np.ndarray: Compiled coefficient vector of shape (N + 3,).
-        """
         control_node_count = len(control_nodes)
         kernel_matrix = np.zeros((control_node_count, control_node_count))
         for row_index in range(control_node_count):
@@ -121,20 +56,6 @@ class FusedMeshSkewTransform:
 
     def _evaluate_thin_plate_spline_field(self, target_coordinate: np.ndarray, control_nodes: np.ndarray, 
                                           coefficients: np.ndarray) -> float:
-        """
-        Interpolates the spatial distortion at an arbitrary 2D position vector.
-
-        Mathematical Formulation:
-            f(x) = a0 + a1*x + a2*y + sum(w_i * U(||x - c_i||))
-
-        Args:
-            target_coordinate (np.ndarray): Localized position vector [x, y]^T to transform.
-            control_nodes (np.ndarray): Baseline control positions matrix of shape (N, 2).
-            coefficients (np.ndarray): Optimized weight parameters vector of shape (N + 3,).
-
-        Returns:
-            float: Extrapolated spatial adjustment value.
-        """
         control_node_count = len(control_nodes)
         warping_weights = coefficients[:control_node_count]
         affine_coefficients = coefficients[control_node_count:]
@@ -146,17 +67,7 @@ class FusedMeshSkewTransform:
         return linear_trend + warping_deformation
 
     def transform_xyz(self, x: float, y: float, z: float) -> Tuple[float, float, float]:
-        """
-        Intercepts nominal toolhead coordinates and applies non-linear mapping filters.
-
-        Args:
-            x (float): Nominal target toolhead coordinate X.
-            y (float): Nominal target toolhead coordinate Y.
-            z (float): Nominal target toolhead coordinate Z.
-
-        Returns:
-            Tuple[float, float, float]: Transformed kinematics coordinates [X', Y', Z'].
-        """
+        """Intercepts nominal toolhead coordinates and applies non-linear mapping filters."""
         if not self.is_mesh_calibrated or self.skew_method == 'none':
             return x, y, z
             
@@ -176,204 +87,91 @@ class FusedMeshSkewTransform:
             
         return output_x, output_y, z
 
-    def cmd_FUSED_BED_MESH_CALIBRATE(self, gcode_command: Any) -> None:
-        """
-        Orchestrates data collection and structural transformation modeling loops.
-
-        Args:
-            gcode_command (Any): Klipper G-code parser executive state token.
-
-        Raises:
-            RuntimeError: If the parsed low-fidelity dataset lacks coordinate pairs
-                within the required 50mm correlation window.
-        """
-        self.is_mesh_calibrated = False
+    def cmd_SAVE_HIGH_FIDELITY_MESH(self, gcode_command: Any) -> None:
+        """Captures the output of the native Beacon contact probing pass into module memory."""
+        bed_mesh_module = self.printer.lookup_ready_object('bed_mesh')
+        z_mesh_wrapper = bed_mesh_module.z_mesh
         
+        # Save raw coordinates and heights directly from Klipper's native generator
+        self.contact_coordinates = np.array(z_mesh_wrapper.get_coords())[:, :2]
+        self.contact_heights = np.array(z_mesh_wrapper.get_mesh()).flatten()
+        
+        self.gcode.respond_info("High-fidelity contact anchor mesh saved to fusion buffer.")
+
+    def cmd_COMPUTE_KINEMATIC_MANIFOLD(self, gcode_command: Any) -> None:
+        """Executes pure mathematical fusion using the saved contact anchors and the active proximity scan."""
+        if self.contact_coordinates is None or self.contact_heights is None:
+            raise gcode_command.error("Fusion error: No contact mesh data in buffer. Orchestration Macro failed.")
+            
+        self.is_mesh_calibrated = False
         beacon_hardware_probe = self.printer.lookup_ready_object('beacon')
         bed_mesh_module = self.printer.lookup_ready_object('bed_mesh')
-        safe_z_home_object = self.printer.lookup_ready_object('safe_z_home')
-        
-        probe_x_offset = float(beacon_hardware_probe.x_offset)
-        probe_y_offset = float(beacon_hardware_probe.y_offset)
-        
-        mesh_minimum_coordinates = [float(bed_mesh_module.min_x), float(bed_mesh_module.min_y)]
-        mesh_maximum_coordinates = [float(bed_mesh_module.max_x), float(bed_mesh_module.max_y)]
-
-        if safe_z_home_object is not None:
-            calibration_center_x = float(safe_z_home_object.home_x_pos)
-            calibration_center_y = float(safe_z_home_object.home_y_pos)
-        else:
-            calibration_center_x = (mesh_minimum_coordinates[0] + mesh_maximum_coordinates[0]) / 2.0
-            calibration_center_y = (mesh_minimum_coordinates[1] + mesh_maximum_coordinates[1]) / 2.0
-
-        skew_correction_module = self.printer.lookup_object('skew_correction', None)
-        if skew_correction_module is not None:
-            self.gcode.respond_info("Active native skew module detected. Clearing kinematics baseline profiles...")
-            self.gcode.run_script_from_command("SET_SKEW CLEAR=1")
-        
         z_mesh_wrapper = bed_mesh_module.z_mesh
+        
+        # Load the newly generated dense inductive scan topology
+        scan_coordinates = np.array(z_mesh_wrapper.get_coords())[:, :2]
+        scan_heights = np.array(z_mesh_wrapper.get_mesh()).flatten()
         grid_shape_x, grid_shape_y = z_mesh_wrapper.probed_matrix.shape
 
-        self.gcode.run_script_from_command("G28 Z0 METHOD=CONTACT")
-
-        if self.solving_method == 'co_kriging':
-            self.gcode.respond_info("Executing dense inductive proximity sweep...")
-            # Fix: Stripped conflicting probe parameters. Uses clean native scan syntax to prevent manual fallback thread drops.
-            self.gcode.run_script_from_command("BED_MESH_CALIBRATE METHOD=scan")
-        elif self.solving_method == 'tps':
-            self.gcode.respond_info("Bypassing inductive sweep loop. Operating strictly on sparse touch anchors...")
-
         beacon_status_dictionary = beacon_hardware_probe.get_status()
-        self.high_fidelity_sensor_noise_standard_deviation = float(beacon_status_dictionary.get('contact_precision_deviation', 0.0012))
-        self.low_fidelity_sensor_noise_standard_deviation = float(beacon_status_dictionary.get('proximity_latency_noise', 0.0045))
+        std_dev_hf = float(beacon_status_dictionary.get('contact_precision_deviation', 0.0012))
+        std_dev_lf = float(beacon_status_dictionary.get('proximity_latency_noise', 0.0045))
 
-        raw_coordinates_low_fidelity = np.array(z_mesh_wrapper.get_coords())[:, :2]
-        raw_heights_low_fidelity = np.array(z_mesh_wrapper.get_mesh()).flatten()
-        transformed_coordinates_low_fidelity = raw_coordinates_low_fidelity + np.array([probe_x_offset, probe_y_offset])
-
-        self.gcode.respond_info(f"Orchestrating contact strikes across an isolated {self.contact_probe_count[0]}x{self.contact_probe_count[1]} grid...")
-        x_ticks = np.linspace(mesh_minimum_coordinates[0], mesh_maximum_coordinates[0], self.contact_probe_count[0])
-        y_ticks = np.linspace(mesh_minimum_coordinates[1], mesh_maximum_coordinates[1], self.contact_probe_count[1])
-        
-        seeded_coordinates = []
-        seeded_heights = []
-        toolhead_object = self.printer.lookup_object('toolhead')
-
-        for y_coord in y_ticks:
-            for x_coord in x_ticks:
-                toolhead_object.manual_move([x_coord - probe_x_offset, y_coord - probe_y_offset, 5.0], 50.0)
-                toolhead_object.wait_moves()
-                
-                self.gcode.run_script_from_command("BEACON_POKE SPEED=5")
-                beacon_status = beacon_hardware_probe.get_status()
-                absolute_height_strike = float(beacon_status.get('last_poke_z', 0.0))
-                
-                seeded_coordinates.append([x_coord, y_coord])
-                seeded_heights.append(absolute_height_strike)
-
-        transformed_coordinates_high_fidelity = np.array(seeded_coordinates)
-        raw_heights_high_fidelity = np.array(seeded_heights)
-
-        high_fidelity_coordinate_distances = np.linalg.norm(transformed_coordinates_high_fidelity[:, None, :] - transformed_coordinates_high_fidelity[None, :, :], axis=-1)
-        micro_spatial_pairs_mask = (high_fidelity_coordinate_distances > 0.0) & (high_fidelity_coordinate_distances <= 15.0)
-        
-        if not np.any(micro_spatial_pairs_mask):
-            self.gcode.respond_info("Injecting local micro-cross structure to stabilize lengthscale convergence...")
-            cross_target_nodes = np.array([
-                [calibration_center_x, calibration_center_y],
-                [calibration_center_x + 10.0, calibration_center_y],
-                [calibration_center_x - 10.0, calibration_center_y],
-                [calibration_center_x, calibration_center_y + 10.0],
-                [calibration_center_x, calibration_center_y - 10.0]
-            ])
-            for target_node in cross_target_nodes:
-                toolhead_object.manual_move([target_node[0] - probe_x_offset, target_node[1] - probe_y_offset, 5.0], 50.0)
-                toolhead_object.wait_moves()
-                
-                self.gcode.run_script_from_command("BEACON_POKE SPEED=5")
-                beacon_status = beacon_hardware_probe.get_status()
-                absolute_height_strike = float(beacon_status.get('last_poke_z', 0.0))
-                
-                transformed_coordinates_high_fidelity = np.vstack((transformed_coordinates_high_fidelity, target_node))
-                raw_heights_high_fidelity = np.concatenate((raw_heights_high_fidelity, np.array([absolute_height_strike])))
-            
-            high_fidelity_coordinate_distances = np.linalg.norm(transformed_coordinates_high_fidelity[:, None, :] - transformed_coordinates_high_fidelity[None, :, :], axis=-1)
-            micro_spatial_pairs_mask = (high_fidelity_coordinate_distances > 0.0) & (high_fidelity_coordinate_distances <= 15.0)
-
-        # 1D Row-by-Row Spatial Profile Interpolation Sequence
-        aligned_heights_low_fidelity = np.zeros_like(raw_heights_high_fidelity)
-        sorting_indices = np.lexsort((transformed_coordinates_low_fidelity[:, 0], transformed_coordinates_low_fidelity[:, 1]))
-        sorted_coords_L = transformed_coordinates_low_fidelity[sorting_indices]
-        sorted_heights_L = raw_heights_low_fidelity[sorting_indices]
-        
-        unique_raster_y_lines = np.unique(transformed_coordinates_high_fidelity[:, 1])
-        for y_line in unique_raster_y_lines:
-            mask_high_fidelity_line = (transformed_coordinates_high_fidelity[:, 1] == y_line)
-            mask_low_fidelity_line = (sorted_coords_L[:, 1] == y_line)
-            
-            if np.any(mask_low_fidelity_line) and np.any(mask_high_fidelity_line):
-                interpolator = PchipInterpolator(sorted_coords_L[mask_low_fidelity_line, 0], sorted_heights_L[mask_low_fidelity_line])
-                aligned_heights_low_fidelity[mask_high_fidelity_line] = interpolator(transformed_coordinates_high_fidelity[mask_high_fidelity_line, 0])
-
-        self.skew_control_nodes = transformed_coordinates_low_fidelity
+        self.skew_control_nodes = scan_coordinates
 
         if self.solving_method == 'co_kriging':
-            # Empirical Low-Fidelity Lengthscale Parametrization Sequence
-            self.process_variance_low_fidelity = float(np.std(raw_heights_low_fidelity))
-            spatial_height_differences = raw_heights_low_fidelity[:, None] - raw_heights_low_fidelity[None, :]
-            spatial_coordinate_distances = np.linalg.norm(transformed_coordinates_low_fidelity[:, None, :] - transformed_coordinates_low_fidelity[None, :, :], axis=-1)
-            
-            valid_spatial_pairs_mask = (spatial_coordinate_distances > 0) & (spatial_coordinate_distances < 50.0)
-            if not np.any(valid_spatial_pairs_mask):
-                raise RuntimeError("Telemetry Error: Proximity dataset lacks dense pairing relationships within 50mm.")
+            # Mathematically robust 2D topological interpolation (Scipy Cubic Fallback to Nearest)
+            aligned_heights_lf = griddata(scan_coordinates, scan_heights, self.contact_coordinates, method='cubic')
+            nans = np.isnan(aligned_heights_lf)
+            if np.any(nans):
+                aligned_heights_lf[nans] = griddata(scan_coordinates, scan_heights, self.contact_coordinates[nans], method='nearest')
                 
-            mean_squared_difference = float(np.mean(spatial_height_differences[valid_spatial_pairs_mask]**2))
-            mean_spatial_correlation = (self.process_variance_low_fidelity**2 - 0.0005 * mean_squared_difference) / (self.process_variance_low_fidelity**2 + 1e-12)
-            mean_spatial_correlation = np.clip(mean_spatial_correlation, 0.01, 0.99)
-            self.spatial_lengthscale_low_fidelity = float(np.mean(spatial_coordinate_distances[valid_spatial_pairs_mask]) / np.sqrt(-2.0 * np.log(mean_spatial_correlation)))
-
-            # Autoregressive Scaling Extraction
-            self.scaling_coefficient_rho = float(np.dot(aligned_heights_low_fidelity, raw_heights_high_fidelity) / np.dot(aligned_heights_low_fidelity, aligned_heights_low_fidelity))
+            # Discrepancy Matrix Solvers
+            rho = float(np.dot(aligned_heights_lf, self.contact_heights) / np.dot(aligned_heights_lf, aligned_heights_lf))
+            discrepancy_vector = self.contact_heights - (rho * aligned_heights_lf)
+            variance_discrepancy = float(np.std(discrepancy_vector))
             
-            # Discrepancy Field Evaluation
-            discrepancy_vector_at_high_coordinates = raw_heights_high_fidelity - (self.scaling_coefficient_rho * aligned_heights_low_fidelity)
-            self.process_variance_discrepancy = float(np.std(discrepancy_vector_at_high_coordinates))
+            hf_coordinate_distances = np.linalg.norm(self.contact_coordinates[:, None, :] - self.contact_coordinates[None, :, :], axis=-1)
+            mean_hf_distance = np.mean(hf_coordinate_distances[hf_coordinate_distances > 0])
+            lengthscale_discrepancy = mean_hf_distance / np.sqrt(-2.0 * np.log(0.5))  # Normalized mid-band correlation
             
-            discrepancy_coordinate_diffs = discrepancy_vector_at_high_coordinates[:, None] - discrepancy_vector_at_high_coordinates[None, :]
-            mean_discrepancy_squared_difference = float(np.mean(discrepancy_coordinate_diffs[micro_spatial_pairs_mask]**2))
-            discrepancy_spatial_correlation = (self.process_variance_discrepancy**2 - 0.0005 * mean_discrepancy_squared_difference) / (self.process_variance_discrepancy**2 + 1e-12)
-            discrepancy_spatial_correlation = np.clip(discrepancy_spatial_correlation, 0.01, 0.99)
-            self.spatial_lengthscale_discrepancy = float(np.mean(high_fidelity_coordinate_distances[micro_spatial_pairs_mask]) / np.sqrt(-2.0 * np.log(discrepancy_spatial_correlation)))
-
-            # Covariance Matrix Conditioning and Regression System Execution
-            auto_cov_delta = self._squared_exponential_kernel(transformed_coordinates_high_fidelity, transformed_coordinates_high_fidelity, self.process_variance_discrepancy, self.spatial_lengthscale_discrepancy) + (self.high_fidelity_sensor_noise_standard_deviation**2) * np.eye(len(transformed_coordinates_high_fidelity))
-            cross_cov_dense_delta = self._squared_exponential_kernel(transformed_coordinates_low_fidelity, transformed_coordinates_high_fidelity, self.process_variance_discrepancy, self.spatial_lengthscale_discrepancy)
+            # Covariance System Inversion
+            auto_cov = self._squared_exponential_kernel(self.contact_coordinates, self.contact_coordinates, variance_discrepancy, lengthscale_discrepancy) + (std_dev_hf**2) * np.eye(len(self.contact_coordinates))
+            cross_cov = self._squared_exponential_kernel(scan_coordinates, self.contact_coordinates, variance_discrepancy, lengthscale_discrepancy)
             
-            dense_predicted_discrepancy_field = np.dot(cross_cov_dense_delta, np.linalg.solve(auto_cov_delta, discrepancy_vector_at_high_coordinates))
-            dense_calibrated_heights = (self.scaling_coefficient_rho * raw_heights_low_fidelity) + dense_predicted_discrepancy_field
+            dense_predicted_discrepancy = np.dot(cross_cov, np.linalg.solve(auto_cov, discrepancy_vector))
+            dense_calibrated_heights = (rho * scan_heights) + dense_predicted_discrepancy
 
         elif self.solving_method == 'tps':
-            dense_calibrated_heights = np.zeros(len(transformed_coordinates_low_fidelity))
-            tps_coefficients_z = self._solve_thin_plate_spline_system(transformed_coordinates_high_fidelity, raw_heights_high_fidelity)
-            for index, node in enumerate(transformed_coordinates_low_fidelity):
-                dense_calibrated_heights[index] = self._evaluate_thin_plate_spline_field(node, transformed_coordinates_high_fidelity, tps_coefficients_z)
+            dense_calibrated_heights = np.zeros(len(scan_coordinates))
+            tps_coefficients_z = self._solve_thin_plate_spline_system(self.contact_coordinates, self.contact_heights)
+            for index, node in enumerate(scan_coordinates):
+                dense_calibrated_heights[index] = self._evaluate_thin_plate_spline_field(node, self.contact_coordinates, tps_coefficients_z)
             
-            dense_predicted_discrepancy_field = dense_calibrated_heights - raw_heights_low_fidelity
+            dense_predicted_discrepancy = dense_calibrated_heights - scan_heights
 
-        # In-Place Klipper Memory Structure Overwrite Sequence
-        self.gcode.respond_info("Solving Gaussian Process Tensors and compiling TPS fields...")
+        # Overwrite active Klipper bed mesh topology in memory
         z_mesh_wrapper.probed_matrix = dense_calibrated_heights.reshape(grid_shape_x, grid_shape_y)
         bed_mesh_module.save_profile("default")
-        self.gcode.respond_info("Surface maps fused and synchronized. Processing configured lateral transformation pass...")
 
         if self.skew_method == 'none':
-            self.is_mesh_calibrated = False
-            self.gcode.respond_info("Skew method set to 'none'. Lateral transformation manifold skipped.")
+            self.gcode.respond_info("Vertical topology fused. Skew method is 'none', manifold skipped.")
             return
 
-        if self.skew_method == 'traditional':
-            self.traditional_alignment_matrix = np.eye(2)
-            self.is_mesh_calibrated = True
-            self.gcode.respond_info("Traditional linear skew transformation applied.")
-            return
-
+        # Solve lateral Non-Linear TPS Field using discrepancy vectors
         if self.skew_method == 'non_linear_field':
-            # Non-Linear Thin Plate Spline Coefficient Solving Phase
-            dense_projected_deviations_x = []
-            dense_projected_deviations_y = []
+            dense_projected_dev_x = []
+            dense_projected_dev_y = []
             for index, node in enumerate(self.skew_control_nodes):
                 angular_direction = float(np.arctan2(node[1], node[0]))
-                dense_projected_deviations_x.append(dense_predicted_discrepancy_field[index] * np.cos(angular_direction))
-                dense_projected_deviations_y.append(dense_predicted_discrepancy_field[index] * np.sin(angular_direction))
+                dense_projected_dev_x.append(dense_predicted_discrepancy[index] * np.cos(angular_direction))
+                dense_projected_dev_y.append(dense_predicted_discrepancy[index] * np.sin(angular_direction))
                 
-            self.thin_plate_spline_coefficients_x = self._solve_thin_plate_spline_system(self.skew_control_nodes, np.array(dense_projected_deviations_x))
-            self.thin_plate_spline_coefficients_y = self._solve_thin_plate_spline_system(self.skew_control_nodes, np.array(dense_projected_deviations_y))
+            self.thin_plate_spline_coefficients_x = self._solve_thin_plate_spline_system(self.skew_control_nodes, np.array(dense_projected_dev_x))
+            self.thin_plate_spline_coefficients_y = self._solve_thin_plate_spline_system(self.skew_control_nodes, np.array(dense_projected_dev_y))
             
             self.is_mesh_calibrated = True
-            self.gcode.respond_info("Multi-fidelity optimization loop complete. Standalone tracking manifold active.")
+            self.gcode.respond_info("Kinematic manifold compiled. TPS skew active.")
 
 def load_config(config: Any) -> FusedMeshSkewTransform:
-    """
-    Klipper internal plugin construction entry point hook.
-    """
     return FusedMeshSkewTransform(config)
