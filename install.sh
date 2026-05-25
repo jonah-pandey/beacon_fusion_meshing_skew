@@ -12,20 +12,27 @@ if grep -Fqs "ID=buildroot" /etc/os-release; then
 fi
 
 if [ ! -d "$KLIPPER_DIRECTORY" ] || [ ! -d "$KLIPPER_ENVIRONMENT" ]; then
-    echo "Installation Aborted: Klipper repository or python environment directory not found."
-    echo "Paths checked -> Repo: $KLIPPER_DIRECTORY | Env: $KLIPPER_ENVIRONMENT"
+    echo "Installation Aborted: Klipper path definitions could not be validated."
     exit 1
 fi
 
 SCRIPT_SOURCE_DIRECTORY="$( cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )"
 TARGET_MODULE_FILE="beacon_meshing_skew.py"
 
-echo "System Status -> Creality OS Embedded: $IS_CREALITY_OS"
-echo "Source File Path: ${SCRIPT_SOURCE_DIRECTORY}/${TARGET_MODULE_FILE}"
+# --- REPOSITORY AUTO-UPDATE SYNC LAYER ---
+echo "Syncing repository branch tracking state..."
+cd "$SCRIPT_SOURCE_DIRECTORY"
+if [ -d ".git" ]; then
+    git fetch origin main
+    # Cache local adjustments temporarily to clear down tree paths cleanly
+    git stash -q || true
+    git merge origin/main --ff-only
+    git stash pop -q || true
+fi
 
-echo "Checking runtime dependencies inside virtual environment..."
+echo "Verifying runtime dependencies inside virtual environment..."
 if ! "$KLIPPER_ENVIRONMENT/bin/python" -c "import numpy; import scipy" 2>/dev/null; then
-    echo "Installing missing dependencies (numpy, scipy) into Klippy virtual environment..."
+    echo "Installing missing scientific packages into Klippy virtual environment..."
     "$KLIPPER_ENVIRONMENT/bin/pip" install --upgrade pip
     "$KLIPPER_ENVIRONMENT/bin/pip" install numpy scipy
 fi
@@ -41,21 +48,20 @@ if [ -e "${SCRIPT_SOURCE_DIRECTORY}/${TARGET_MODULE_FILE}" ]; then
     ln -s "${SCRIPT_SOURCE_DIRECTORY}/${TARGET_MODULE_FILE}" "$TARGET_LINK_PATH"
     
     GIT_EXCLUDE_FILE="${KLIPPER_DIRECTORY}/.git/info/exclude"
-    if [ -d "${KLIPPER_DIRECTORY}/.git" ]; then
+    if [ -d "$KLIPPER_DIRECTORY/.git" ]; then
         if ! grep -q "klippy/extras/${TARGET_MODULE_FILE}" "$GIT_EXCLUDE_FILE"; then
-            echo "Registering module path inside .git/info/exclude filter..."
             echo "klippy/extras/${TARGET_MODULE_FILE}" >> "$GIT_EXCLUDE_FILE"
         fi
     fi
 else
-    echo "Installation Failure: Target file '${TARGET_MODULE_FILE}' was not found in the script's folder."
+    echo "Installation Failure: Target extension file missing from execution folder path."
     exit 1
 fi
 
-echo "Module deployed successfully. Refreshing Klipper daemon..."
+echo "Extension deployed. Cycling Klipper host services..."
 if [ $IS_CREALITY_OS -eq 1 ]; then
     killall python 2>/dev/null || true
 else
     sudo systemctl restart klipper
 fi
-echo "Done."
+echo "Update loop completed successfully."
