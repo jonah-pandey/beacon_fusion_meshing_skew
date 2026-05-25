@@ -5,12 +5,15 @@ from typing import List, Tuple, Optional, Any
 class FusedMeshSkewTransform:
     def __init__(self, config: Any) -> None:
         """
-        Caches the initial configuration instance. Postpones all cross-module
-        lookups to handle_connect to bypass Klipper initialization constraints.
+        Initializes the transform instance and caches the initialization ConfigWrapper.
+        Postpones cross-section option reads to handle_connect to honor Klipper's
+        internal sub-module initialization order.
         """
         self.printer: Any = config.get_printer()
         self.gcode: Any = self.printer.lookup_object('gcode')
-        self.config: Any = config
+        
+        # Cache the initial ConfigWrapper safely to serve as our root configuration hook
+        self.base_config: Any = config
         
         self.solving_method: str = config.get('solving_method').lower()
         if self.solving_method not in ['tps', 'co_kriging']:
@@ -55,8 +58,8 @@ class FusedMeshSkewTransform:
 
     def handle_connect(self) -> None:
         """
-        Runs after the full configuration block has parsed cleanly. Inherits 
-        mesh coordinates safely and hooks into the active hardware profiles.
+        Runs on the Klippy connect hook after all system objects are constructed.
+        Safely extracts configurations across sections to establish a clean data baseline.
         """
         self.beacon_hardware_probe = self.printer.lookup_object('beacon', None)
         if self.beacon_hardware_probe is None:
@@ -65,10 +68,11 @@ class FusedMeshSkewTransform:
         self.probe_x_offset = float(self.beacon_hardware_probe.x_offset)
         self.probe_y_offset = float(self.beacon_hardware_probe.y_offset)
 
-        config_wrapper = self.printer.lookup_object('configfile')
-        bed_mesh_config = config_wrapper.config.getsection('bed_mesh')
-        if bed_mesh_config is None:
-            raise self.printer.config_error("Configuration Error: [bed_mesh] section must be defined.")
+        # Inherit the target bed boundaries using Klipper's native cross-section lookup
+        try:
+            bed_mesh_config = self.base_config.getsection('bed_mesh')
+        except Exception:
+            raise self.printer.config_error("Configuration Error: [bed_mesh] section must be defined to inherit parameters.")
             
         self.mesh_minimum_coordinates = bed_mesh_config.getfloatlist('mesh_min', count=2)
         self.mesh_maximum_coordinates = bed_mesh_config.getfloatlist('mesh_max', count=2)
