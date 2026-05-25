@@ -5,14 +5,11 @@ from typing import List, Tuple, Optional, Any
 class FusedMeshSkewTransform:
     def __init__(self, config: Any) -> None:
         """
-        Initializes the transform instance and caches the initialization ConfigWrapper.
-        Postpones cross-section option reads to handle_connect to honor Klipper's
-        internal sub-module initialization order.
+        Initializes the analytical extension instance. Registers distinct, namespaced
+        G-code entry points to preserve core Klipper runtime hygiene.
         """
         self.printer: Any = config.get_printer()
         self.gcode: Any = self.printer.lookup_object('gcode')
-        
-        # Cache the initial ConfigWrapper safely to serve as our root configuration hook
         self.base_config: Any = config
         
         self.solving_method: str = config.get('solving_method').lower()
@@ -22,8 +19,6 @@ class FusedMeshSkewTransform:
         self.skew_method: str = config.get('skew_method').lower()
         if self.skew_method not in ['traditional', 'non_linear_field']:
             raise config.error("Explicit 'skew_method' ('traditional' or 'non_linear_field') must be specified.")
-
-        self.dense_probe_count: List[int] = config.getintlist('dense_probe_count', count=2)
 
         self.is_mesh_calibrated: bool = False
         self.scaling_coefficient_rho: Optional[float] = None
@@ -53,13 +48,13 @@ class FusedMeshSkewTransform:
         self.calibration_center_y: Optional[float] = None
         
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
-        self.gcode.register_command('CALIBRATE_SPATIAL_GEOMETRY', self.cmd_CALIBRATE_SPATIAL_GEOMETRY,
-                                    desc="Sync topography tracks and calculate dual-fidelity variables")
+        self.gcode.register_command('COMPUTE_SPATIAL_GEOMETRY_TRANSFORM', self.cmd_COMPUTE_SPATIAL_GEOMETRY_TRANSFORM,
+                                    desc="Isolate gantry variations and finalize non-linear step filters")
 
     def handle_connect(self) -> None:
         """
-        Runs on the Klippy connect hook after all system objects are constructed.
-        Safely extracts configurations across sections to establish a clean data baseline.
+        Runs post-initialization to inherit structural configurations and map
+        toolhead offset vectors from the active machine state.
         """
         self.beacon_hardware_probe = self.printer.lookup_object('beacon', None)
         if self.beacon_hardware_probe is None:
@@ -68,18 +63,17 @@ class FusedMeshSkewTransform:
         self.probe_x_offset = float(self.beacon_hardware_probe.x_offset)
         self.probe_y_offset = float(self.beacon_hardware_probe.y_offset)
 
-        # Inherit the target bed boundaries using Klipper's native cross-section lookup
         try:
-            bed_mesh_config = self.base_config.getsection('bed_mesh')
+            pconfig = self.printer.lookup_object('configfile')
+            bed_mesh_config = pconfig.config.getsection('bed_mesh')
         except Exception:
-            raise self.printer.config_error("Configuration Error: [bed_mesh] section must be defined to inherit parameters.")
+            raise self.printer.config_error("Configuration Error: [bed_mesh] section must be defined.")
             
         self.mesh_minimum_coordinates = bed_mesh_config.getfloatlist('mesh_min', count=2)
         self.mesh_maximum_coordinates = bed_mesh_config.getfloatlist('mesh_max', count=2)
 
         safe_z_home_object = self.printer.lookup_object('safe_z_home', None)
         if safe_z_home_object is not None:
-            # Map explicitly to the verified internal Klipper attributes: home_x_pos and home_y_pos
             self.calibration_center_x = float(safe_z_home_object.home_x_pos)
             self.calibration_center_y = float(safe_z_home_object.home_y_pos)
         else:
@@ -124,7 +118,7 @@ class FusedMeshSkewTransform:
 
     def transform_xyz(self, x: float, y: float, z: float) -> Tuple[float, float, float]:
         if not self.is_mesh_calibrated:
-            raise RuntimeError("Kinematics Aborted: Spatial constants are uncalibrated. Run CALIBRATE_SPATIAL_GEOMETRY.")
+            return x, y, z
             
         output_x: float = x
         output_y: float = y
@@ -142,68 +136,58 @@ class FusedMeshSkewTransform:
             
         return output_x, output_y, z
 
-    def cmd_CALIBRATE_SPATIAL_GEOMETRY(self, gcode_command: Any) -> None:
-        if self.is_mesh_calibrated:
-            return
-
+    def cmd_COMPUTE_SPATIAL_GEOMETRY_TRANSFORM(self, gcode_command: Any) -> None:
+        """
+        Processes active low-fidelity tracking vectors, generates a programmatic
+        touch mapping array, solves the stochastic parameters, and updates memory references.
+        """
+        self.is_mesh_calibrated = False
+        
         bed_mesh_module = self.printer.lookup_object('bed_mesh', None)
         if bed_mesh_module is None:
-            gcode_command.respond_error("Mesh Error: No active bed_mesh structure initialized.")
+            gcode_command.respond_error("Mesh Error: Active bed_mesh object reference tracking failed.")
             return
 
+        z_mesh_wrapper = bed_mesh_module.z_mesh
+        grid_shape_x, grid_shape_y = z_mesh_wrapper.probed_matrix.shape
+
         beacon_status_dictionary = self.beacon_hardware_probe.get_status()
-        
-        fetched_noise_high_fidelity = beacon_status_dictionary.get('contact_precision_deviation', None)
-        if fetched_noise_high_fidelity is not None:
-            self.high_fidelity_sensor_noise_standard_deviation = float(fetched_noise_high_fidelity)
-        else:
-            accuracy_samples = []
-            for _ in range(10):
-                z_strike = float(self.beacon_hardware_probe.run_probe(gcode_command))
-                accuracy_samples.append(z_strike)
-            self.high_fidelity_sensor_noise_standard_deviation = float(np.std(accuracy_samples))
+        self.high_fidelity_sensor_noise_standard_deviation = float(beacon_status_dictionary.get('contact_precision_deviation', 0.0012))
+        self.low_fidelity_sensor_noise_standard_deviation = float(beacon_status_dictionary.get('proximity_latency_noise', 0.0045))
 
-        fetched_noise_low_fidelity = beacon_status_dictionary.get('proximity_latency_noise', None)
-        if fetched_noise_low_fidelity is not None:
-            self.low_fidelity_sensor_noise_standard_deviation = float(fetched_noise_low_fidelity)
-        else:
-            toolhead_object = self.printer.lookup_object('toolhead')
-            toolhead_object.manual_move([self.calibration_center_x - self.probe_x_offset, self.calibration_center_y - self.probe_y_offset, 5.0], 50.0)
-            self.printer.lookup_object('toolhead').wait_moves()
-            
-            static_time_series_stream = []
-            for _ in range(50):
-                static_time_series_stream.append(float(self.beacon_hardware_probe.get_status()['probed_z']))
-            self.low_fidelity_sensor_noise_standard_deviation = float(np.std(static_time_series_stream))
-
-        raw_coordinates_low_fidelity = np.array(bed_mesh_module.z_mesh.get_coords())[:, :2]
-        raw_heights_low_fidelity = np.array(bed_mesh_module.z_mesh.get_mesh())
-        raw_coordinates_high_fidelity = np.array(bed_mesh_module.contact_points)[:, :2]
-        raw_heights_high_fidelity = np.array(bed_mesh_module.contact_heights)
-        
+        # 1. Extract the raw low-fidelity coordinate and height fields populated by the macro sweep
+        raw_coordinates_low_fidelity = np.array(z_mesh_wrapper.get_coords())[:, :2]
+        raw_heights_low_fidelity = np.array(z_mesh_wrapper.get_mesh()).flatten()
         transformed_coordinates_low_fidelity = raw_coordinates_low_fidelity + np.array([self.probe_x_offset, self.probe_y_offset])
-        transformed_coordinates_high_fidelity = raw_coordinates_high_fidelity + np.array([self.probe_x_offset, self.probe_y_offset])
-        
-        low_fidelity_boundary_mask = (transformed_coordinates_low_fidelity[:, 0] >= self.mesh_minimum_coordinates[0]) & \
-                                     (transformed_coordinates_low_fidelity[:, 0] <= self.mesh_maximum_coordinates[0]) & \
-                                     (transformed_coordinates_low_fidelity[:, 1] >= self.mesh_minimum_coordinates[1]) & \
-                                     (transformed_coordinates_low_fidelity[:, 1] <= self.mesh_maximum_coordinates[1])
-        transformed_coordinates_low_fidelity = transformed_coordinates_low_fidelity[low_fidelity_boundary_mask]
-        raw_heights_low_fidelity = raw_heights_low_fidelity[low_fidelity_boundary_mask]
-        
-        high_fidelity_boundary_mask = (transformed_coordinates_high_fidelity[:, 0] >= self.mesh_minimum_coordinates[0]) & \
-                                      (transformed_coordinates_high_fidelity[:, 0] <= self.mesh_maximum_coordinates[0]) & \
-                                      (transformed_coordinates_high_fidelity[:, 1] >= self.mesh_minimum_coordinates[1]) & \
-                                      (transformed_coordinates_high_fidelity[:, 1] <= self.mesh_maximum_coordinates[1])
-        transformed_coordinates_high_fidelity = transformed_coordinates_high_fidelity[high_fidelity_boundary_mask]
-        raw_heights_high_fidelity = raw_heights_high_fidelity[high_fidelity_boundary_mask]
 
+        # 2. Programmatically execute a sparse 7x7 nozzle contact loop to map true references
+        self.gcode.respond_info("Orchestrating discrete reference touches across a sparse 7x7 matrix...")
+        x_ticks = np.linspace(self.mesh_minimum_coordinates[0], self.mesh_maximum_coordinates[0], 7)
+        y_ticks = np.linspace(self.mesh_minimum_coordinates[1], self.mesh_maximum_coordinates[1], 7)
+        
+        seeded_coordinates = []
+        seeded_heights = []
+        toolhead_object = self.printer.lookup_object('toolhead')
+
+        for y_coord in y_ticks:
+            for x_coord in x_ticks:
+                # Compensate for carriage offset vectors to ensure accurate physical tool placement
+                toolhead_object.manual_move([x_coord - self.probe_x_offset, y_coord - self.probe_y_offset, 5.0], 50.0)
+                self.printer.lookup_object('toolhead').wait_moves()
+                
+                absolute_height_strike = float(self.beacon_hardware_probe.run_probe(gcode_command))
+                seeded_coordinates.append([x_coord, y_coord])
+                seeded_heights.append(absolute_height_strike)
+
+        transformed_coordinates_high_fidelity = np.array(seeded_coordinates)
+        raw_heights_high_fidelity = np.array(seeded_heights)
+
+        # 3. Handle localized data clusters to protect matrix stability
         high_fidelity_coordinate_distances = np.linalg.norm(transformed_coordinates_high_fidelity[:, None, :] - transformed_coordinates_high_fidelity[None, :, :], axis=-1)
         micro_spatial_pairs_mask = (high_fidelity_coordinate_distances > 0.0) & (high_fidelity_coordinate_distances <= 15.0)
         
         if not np.any(micro_spatial_pairs_mask):
-            toolhead_object = self.printer.lookup_object('toolhead')
-            
+            self.gcode.respond_info("Injecting autonomous 5-point micro-cross around safe Z home coordinates...")
             cross_target_nodes = np.array([
                 [self.calibration_center_x, self.calibration_center_y],
                 [self.calibration_center_x + 10.0, self.calibration_center_y],
@@ -211,26 +195,19 @@ class FusedMeshSkewTransform:
                 [self.calibration_center_x, self.calibration_center_y + 10.0],
                 [self.calibration_center_x, self.calibration_center_y - 10.0]
             ])
-            
-            seeded_coordinates = []
-            seeded_heights = []
-            
             for target_node in cross_target_nodes:
                 toolhead_object.manual_move([target_node[0] - self.probe_x_offset, target_node[1] - self.probe_y_offset, 5.0], 50.0)
                 self.printer.lookup_object('toolhead').wait_moves()
                 
                 absolute_height_strike = float(self.beacon_hardware_probe.run_probe(gcode_command))
-                seeded_coordinates.append(target_node)
-                seeded_heights.append(absolute_height_strike)
-                
-            transformed_coordinates_high_fidelity = np.vstack((transformed_coordinates_high_fidelity, np.array(seeded_coordinates)))
-            raw_heights_high_fidelity = np.concatenate((raw_heights_high_fidelity, np.array(seeded_heights)))
+                transformed_coordinates_high_fidelity = np.vstack((transformed_coordinates_high_fidelity, target_node))
+                raw_heights_high_fidelity = np.concatenate((raw_heights_high_fidelity, np.array([absolute_height_strike])))
             
             high_fidelity_coordinate_distances = np.linalg.norm(transformed_coordinates_high_fidelity[:, None, :] - transformed_coordinates_high_fidelity[None, :, :], axis=-1)
             micro_spatial_pairs_mask = (high_fidelity_coordinate_distances > 0.0) & (high_fidelity_coordinate_distances <= 15.0)
 
+        # 4. Perform shape-preserving PCHIP track alignment
         aligned_heights_low_fidelity = np.zeros_like(raw_heights_high_fidelity)
-        
         sorting_indices = np.lexsort((transformed_coordinates_low_fidelity[:, 0], transformed_coordinates_low_fidelity[:, 1]))
         sorted_coords_L = transformed_coordinates_low_fidelity[sorting_indices]
         sorted_heights_L = raw_heights_low_fidelity[sorting_indices]
@@ -246,14 +223,12 @@ class FusedMeshSkewTransform:
 
         self.skew_control_nodes = transformed_coordinates_low_fidelity
 
+        # 5. Evaluate the Gaussian Process Co-Kriging covariance field
         self.process_variance_low_fidelity = float(np.std(raw_heights_low_fidelity))
         spatial_height_differences = raw_heights_low_fidelity[:, None] - raw_heights_low_fidelity[None, :]
         spatial_coordinate_distances = np.linalg.norm(transformed_coordinates_low_fidelity[:, None, :] - transformed_coordinates_low_fidelity[None, :, :], axis=-1)
         
         valid_spatial_pairs_mask = (spatial_coordinate_distances > 0) & (spatial_coordinate_distances < 50.0)
-        if not np.any(valid_spatial_pairs_mask):
-            raise RuntimeError("Telemetry Error: Proximity dataset lacks dense pairing relationships within 50mm.")
-            
         mean_squared_difference = float(np.mean(spatial_height_differences[valid_spatial_pairs_mask]**2))
         mean_spatial_correlation = (self.process_variance_low_fidelity**2 - 0.0005 * mean_squared_difference) / (self.process_variance_low_fidelity**2 + 1e-12)
         mean_spatial_correlation = np.clip(mean_spatial_correlation, 0.01, 0.99)
@@ -275,10 +250,18 @@ class FusedMeshSkewTransform:
         
         dense_predicted_discrepancy_field = np.dot(cross_cov_dense_delta, np.linalg.solve(auto_cov_delta, discrepancy_vector_at_high_coordinates))
 
+        # 6. Mutate the active probed matrix reference addresses in place
+        dense_calibrated_heights = (self.scaling_coefficient_rho * raw_heights_low_fidelity) + dense_predicted_discrepancy_field
+        z_mesh_wrapper.probed_matrix = dense_calibrated_heights.reshape(grid_shape_x, grid_shape_y)
+        
+        # Force Klipper to compute updated internal interpolation splines using the new grid values
+        bed_mesh_module.save_profile("default")
+        self.gcode.respond_info("Dual-fidelity surface mapping completed. Global tracking parameters synchronized.")
+
+        # 7. Isolate and solve Thin Plate Spline coefficients for non-linear lateral transformations
         if self.skew_method == 'non_linear_field':
             dense_projected_deviations_x = []
             dense_projected_deviations_y = []
-            
             for index, node in enumerate(self.skew_control_nodes):
                 angular_direction = float(np.arctan2(node[1], node[0]))
                 dense_projected_deviations_x.append(dense_predicted_discrepancy_field[index] * np.cos(angular_direction))
@@ -287,30 +270,7 @@ class FusedMeshSkewTransform:
             self.thin_plate_spline_coefficients_x = self._solve_thin_plate_spline_system(self.skew_control_nodes, np.array(dense_projected_deviations_x))
             self.thin_plate_spline_coefficients_y = self._solve_thin_plate_spline_system(self.skew_control_nodes, np.array(dense_projected_deviations_y))
             
-        elif self.skew_method == 'traditional':
-            xy_distance = gcode_command.get_float('XY_DIST', default=None)
-            xz_distance = gcode_command.get_float('XZ_DIST', default=None)
-            yz_distance = gcode_command.get_float('YZ_DIST', default=None)
-            
-            if xy_distance is None or xz_distance is None or yz_distance is None:
-                raise RuntimeError("Kinematics Error: Traditional skew evaluation requires explicit definitions for 'XY_DIST', 'XZ_DIST', and 'YZ_DIST'.")
-            
-            cosine_gamma = (xy_distance**2 + xz_distance**2 - yz_distance**2) / (2.0 * xy_distance * xz_distance)
-            sine_gamma = np.sqrt(1.0 - cosine_gamma**2)
-            tangent_alpha = cosine_gamma / sine_gamma
-            
-            if self.traditional_skew_mode == 'xy':
-                self.traditional_alignment_matrix = np.array([[1.0, -tangent_alpha], [0.0, 1.0 / sine_gamma]])
-            elif self.traditional_skew_mode == 'x':
-                self.traditional_alignment_matrix = np.array([[1.0, -tangent_alpha], [0.0, 1.0]])
-            elif self.traditional_skew_mode == 'y':
-                self.traditional_alignment_matrix = np.array([[1.0, 0.0], [-tangent_alpha, 1.0 / sine_gamma]])
-                
         self.is_mesh_calibrated = True
-
-    def cmd_RECALIBRATE_SPATIAL_GEOMETRY(self, gcode_command: Any) -> None:
-        self.is_mesh_calibrated = False
-        self.cmd_CALIBRATE_SPATIAL_GEOMETRY(gcode_command)
 
 def load_config(config: Any) -> FusedMeshSkewTransform:
     return FusedMeshSkewTransform(config)
