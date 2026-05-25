@@ -79,8 +79,9 @@ class FusedMeshSkewTransform:
 
         safe_z_home_object = self.printer.lookup_object('safe_z_home', None)
         if safe_z_home_object is not None:
-            self.calibration_center_x = float(safe_z_home_object.home_x)
-            self.calibration_center_y = float(safe_z_home_object.home_y)
+            # Map explicitly to the verified internal Klipper attributes: home_x_pos and home_y_pos
+            self.calibration_center_x = float(safe_z_home_object.home_x_pos)
+            self.calibration_center_y = float(safe_z_home_object.home_y_pos)
         else:
             self.calibration_center_x = (self.mesh_minimum_coordinates[0] + self.mesh_maximum_coordinates[0]) / 2.0
             self.calibration_center_y = (self.mesh_minimum_coordinates[1] + self.mesh_maximum_coordinates[1]) / 2.0
