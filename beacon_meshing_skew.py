@@ -217,8 +217,9 @@ class FusedMeshSkewTransform:
         self.gcode.run_script_from_command("G28 Z0 METHOD=CONTACT")
 
         if self.solving_method == 'co_kriging':
-            self.gcode.respond_info("Invoking native inductive proximity sweep loop for Co-Kriging...")
-            self.gcode.run_script_from_command("BED_MESH_CALIBRATE METHOD=scan PROBE_METHOD=proximity")
+            self.gcode.respond_info("Executing dense inductive proximity sweep...")
+            # Fix: Stripped conflicting probe parameters. Uses clean native scan syntax to prevent manual fallback thread drops.
+            self.gcode.run_script_from_command("BED_MESH_CALIBRATE METHOD=scan")
         elif self.solving_method == 'tps':
             self.gcode.respond_info("Bypassing inductive sweep loop. Operating strictly on sparse touch anchors...")
 
@@ -340,6 +341,7 @@ class FusedMeshSkewTransform:
             dense_predicted_discrepancy_field = dense_calibrated_heights - raw_heights_low_fidelity
 
         # In-Place Klipper Memory Structure Overwrite Sequence
+        self.gcode.respond_info("Solving Gaussian Process Tensors and compiling TPS fields...")
         z_mesh_wrapper.probed_matrix = dense_calibrated_heights.reshape(grid_shape_x, grid_shape_y)
         bed_mesh_module.save_profile("default")
         self.gcode.respond_info("Surface maps fused and synchronized. Processing configured lateral transformation pass...")
