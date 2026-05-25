@@ -5,8 +5,8 @@ from typing import List, Tuple, Optional, Any
 class FusedMeshSkewTransform:
     def __init__(self, config: Any) -> None:
         """
-        Initializes the transform instance and caches the raw configuration parameters.
-        Postpones cross-module lookups to handle_connect to prevent initialization ordering panics.
+        Caches the initial configuration instance. Postpones all cross-module
+        lookups to handle_connect to bypass Klipper initialization constraints.
         """
         self.printer: Any = config.get_printer()
         self.gcode: Any = self.printer.lookup_object('gcode')
@@ -19,6 +19,8 @@ class FusedMeshSkewTransform:
         self.skew_method: str = config.get('skew_method').lower()
         if self.skew_method not in ['traditional', 'non_linear_field']:
             raise config.error("Explicit 'skew_method' ('traditional' or 'non_linear_field') must be specified.")
+
+        self.dense_probe_count: List[int] = config.getintlist('dense_probe_count', count=2)
 
         self.is_mesh_calibrated: bool = False
         self.scaling_coefficient_rho: Optional[float] = None
@@ -53,9 +55,8 @@ class FusedMeshSkewTransform:
 
     def handle_connect(self) -> None:
         """
-        Runs on Klippy establishment hook to grab toolhead offsets, secure the 
-        safe Z home target coordinates, and safely inherit the single-definition 
-        mesh boundary limits from the active bed_mesh config block.
+        Runs after the full configuration block has parsed cleanly. Inherits 
+        mesh coordinates safely and hooks into the active hardware profiles.
         """
         self.beacon_hardware_probe = self.printer.lookup_object('beacon', None)
         if self.beacon_hardware_probe is None:
@@ -64,11 +65,10 @@ class FusedMeshSkewTransform:
         self.probe_x_offset = float(self.beacon_hardware_probe.x_offset)
         self.probe_y_offset = float(self.beacon_hardware_probe.y_offset)
 
-        # Safely extract configuration blocks now that Klipper has parsed the full tree
         config_wrapper = self.printer.lookup_object('configfile')
         bed_mesh_config = config_wrapper.config.getsection('bed_mesh')
         if bed_mesh_config is None:
-            raise self.printer.config_error("Configuration Error: [bed_mesh] section must be defined to inherit boundaries.")
+            raise self.printer.config_error("Configuration Error: [bed_mesh] section must be defined.")
             
         self.mesh_minimum_coordinates = bed_mesh_config.getfloatlist('mesh_min', count=2)
         self.mesh_maximum_coordinates = bed_mesh_config.getfloatlist('mesh_max', count=2)

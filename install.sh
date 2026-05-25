@@ -19,12 +19,10 @@ fi
 SCRIPT_SOURCE_DIRECTORY="$( cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )"
 TARGET_MODULE_FILE="beacon_meshing_skew.py"
 
-# --- REPOSITORY AUTO-UPDATE SYNC LAYER ---
-echo "Syncing repository branch tracking state..."
+echo "Syncing repository tracking branch state..."
 cd "$SCRIPT_SOURCE_DIRECTORY"
 if [ -d ".git" ]; then
     git fetch origin main
-    # Cache local adjustments temporarily to clear down tree paths cleanly
     git stash -q || true
     git merge origin/main --ff-only
     git stash pop -q || true
