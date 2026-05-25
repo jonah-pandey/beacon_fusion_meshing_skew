@@ -5,8 +5,8 @@ from typing import List, Tuple, Optional, Any
 class FusedMeshSkewTransform:
     def __init__(self, config: Any) -> None:
         """
-        Initializes the analytical extension instance. Registers distinct, namespaced
-        G-code entry points to preserve core Klipper runtime hygiene.
+        Initializes the analytical extension instance. Dynamically parses config
+        keys to eliminate hardcoded spatial matrix boundaries.
         """
         self.printer: Any = config.get_printer()
         self.gcode: Any = self.printer.lookup_object('gcode')
@@ -19,6 +19,9 @@ class FusedMeshSkewTransform:
         self.skew_method: str = config.get('skew_method').lower()
         if self.skew_method not in ['traditional', 'non_linear_field']:
             raise config.error("Explicit 'skew_method' ('traditional' or 'non_linear_field') must be specified.")
+
+        # Dynamically map the high-fidelity sampling array counts
+        self.contact_probe_count: List[int] = config.getintlist('contact_probe_count', default=[7, 7], count=2)
 
         self.is_mesh_calibrated: bool = False
         self.scaling_coefficient_rho: Optional[float] = None
@@ -137,10 +140,6 @@ class FusedMeshSkewTransform:
         return output_x, output_y, z
 
     def cmd_COMPUTE_SPATIAL_GEOMETRY_TRANSFORM(self, gcode_command: Any) -> None:
-        """
-        Processes active low-fidelity tracking vectors, generates a programmatic
-        touch mapping array, solves the stochastic parameters, and updates memory references.
-        """
         self.is_mesh_calibrated = False
         
         bed_mesh_module = self.printer.lookup_object('bed_mesh', None)
@@ -160,10 +159,10 @@ class FusedMeshSkewTransform:
         raw_heights_low_fidelity = np.array(z_mesh_wrapper.get_mesh()).flatten()
         transformed_coordinates_low_fidelity = raw_coordinates_low_fidelity + np.array([self.probe_x_offset, self.probe_y_offset])
 
-        # 2. Programmatically execute a sparse 7x7 nozzle contact loop to map true references
-        self.gcode.respond_info("Orchestrating discrete reference touches across a sparse 7x7 matrix...")
-        x_ticks = np.linspace(self.mesh_minimum_coordinates[0], self.mesh_maximum_coordinates[0], 7)
-        y_ticks = np.linspace(self.mesh_minimum_coordinates[1], self.mesh_maximum_coordinates[1], 7)
+        # 2. Programmatically execute a sparse contact loop mapped to the configuration inputs
+        self.gcode.respond_info(f"Orchestrating contact strikes across a sparse {self.contact_probe_count[0]}x{self.contact_probe_count[1]} matrix...")
+        x_ticks = np.linspace(self.mesh_minimum_coordinates[0], self.mesh_maximum_coordinates[0], self.contact_probe_count[0])
+        y_ticks = np.linspace(self.mesh_minimum_coordinates[1], self.mesh_maximum_coordinates[1], self.contact_probe_count[1])
         
         seeded_coordinates = []
         seeded_heights = []
@@ -171,7 +170,6 @@ class FusedMeshSkewTransform:
 
         for y_coord in y_ticks:
             for x_coord in x_ticks:
-                # Compensate for carriage offset vectors to ensure accurate physical tool placement
                 toolhead_object.manual_move([x_coord - self.probe_x_offset, y_coord - self.probe_y_offset, 5.0], 50.0)
                 self.printer.lookup_object('toolhead').wait_moves()
                 
